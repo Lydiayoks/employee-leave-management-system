@@ -1,0 +1,65 @@
+type Employee = record {
+  id : nat64;
+  leave_balances : vec record { LeaveName; nat32 };
+  name : text;
+  created_at : nat64;
+  email : text;
+};
+type EmployeePayload = record { name : text; email : text };
+type LeaveName = variant { Sick; Maternity; Annual; Unpaid; Paternity };
+type LeaveRequest = record {
+  id : nat64;
+  status : text;
+  leave_type_id : nat64;
+  end_date : nat64;
+  created_at : nat64;
+  start_date : nat64;
+  employee_id : nat64;
+  reason : text;
+};
+type LeaveRequestPayload = record {
+  leave_type_id : nat64;
+  end_date : nat64;
+  start_date : nat64;
+  employee_id : nat64;
+  reason : text;
+};
+type LeaveType = record {
+  id : nat64;
+  name : LeaveName;
+  quota : nat32;
+  created_at : nat64;
+  carryover_allowed : bool;
+};
+type LeaveTypePayload = record {
+  name : LeaveName;
+  quota : nat32;
+  carryover_allowed : bool;
+};
+type Message = variant {
+  Error : text;
+  InvalidPayload : text;
+  NotFound : text;
+  Success : text;
+};
+type Result = variant { Ok : Message; Err : Message };
+type Result_1 = variant { Ok : Employee; Err : Message };
+type Result_2 = variant { Ok : LeaveRequest; Err : Message };
+type Result_3 = variant { Ok : LeaveType; Err : Message };
+type Result_4 = variant { Ok : text; Err : Message };
+type Result_5 = variant { Ok : vec Employee; Err : Message };
+type Result_6 = variant { Ok : vec LeaveRequest; Err : Message };
+type Result_7 = variant { Ok : vec LeaveType; Err : Message };
+service : {
+  accrue_leave : (nat64) -> (Result);
+  approve_leave_request : (nat64) -> (Result);
+  cancel_leave_request : (nat64) -> (Result);
+  create_employee : (EmployeePayload) -> (Result_1);
+  create_leave_request : (LeaveRequestPayload) -> (Result_2);
+  create_leave_type : (LeaveTypePayload) -> (Result_3);
+  generate_leave_report : (nat64) -> (Result_4) query;
+  get_employees : () -> (Result_5) query;
+  get_leave_requests : () -> (Result_6) query;
+  get_leave_types : () -> (Result_7) query;
+  reject_leave_request : (nat64) -> (Result);
+}
