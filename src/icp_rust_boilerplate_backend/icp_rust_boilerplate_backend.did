@@ -9,7 +9,7 @@ type EmployeePayload = record { name : text; email : text };
 type LeaveName = variant { Sick; Maternity; Annual; Unpaid; Paternity };
 type LeaveRequest = record {
   id : nat64;
-  status : text;
+  status : LeaveStatusEnum;
   leave_type_id : nat64;
   end_date : nat64;
   created_at : nat64;
@@ -23,6 +23,13 @@ type LeaveRequestPayload = record {
   start_date : nat64;
   employee_id : nat64;
   reason : text;
+};
+type LeaveStatusEnum = variant {
+  Approved;
+  Accrued;
+  Rejected;
+  Canceled;
+  Pending;
 };
 type LeaveType = record {
   id : nat64;
@@ -59,7 +66,10 @@ service : {
   create_leave_type : (LeaveTypePayload) -> (Result_3);
   generate_leave_report : (nat64) -> (Result_4) query;
   get_employees : () -> (Result_5) query;
+  get_leave_history : (nat64) -> (Result_6) query;
   get_leave_requests : () -> (Result_6) query;
   get_leave_types : () -> (Result_7) query;
   reject_leave_request : (nat64) -> (Result);
+  search_employee : (text) -> (Result_5) query;
+  update_leave_balance : (nat64, LeaveName, nat32) -> (Result);
 }
