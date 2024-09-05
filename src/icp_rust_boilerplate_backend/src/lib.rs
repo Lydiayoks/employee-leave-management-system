@@ -5,7 +5,7 @@ use ic_cdk::api::time;
 use ic_stable_structures::memory_manager::{MemoryId, MemoryManager, VirtualMemory};
 use ic_stable_structures::{BoundedStorable, Cell, DefaultMemoryImpl, StableBTreeMap, Storable};
 use std::fmt;
-use std::{borrow::Cow, cell::RefCell};
+use std::{borrow::Cow, cell::RefCell, collections::HashMap};
 
 type Memory = VirtualMemory<DefaultMemoryImpl>;
 type IdCell = Cell<u64, Memory>;
@@ -15,15 +15,11 @@ struct Employee {
     id: u64,
     name: String,
     email: String,
-    leave_balances: std::collections::HashMap<LeaveName, u32>, // Balances per leave type
+    leave_balances: HashMap<LeaveName, u32>, // Balances per leave type
     created_at: u64,
 }
 
-// LeaveName enum
-#[derive(
-    candid::CandidType, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Default, Debug,
-)]
-
+#[derive(candid::CandidType, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Default, Debug)]
 enum LeaveName {
     #[default]
     Annual,
@@ -33,7 +29,6 @@ enum LeaveName {
     Unpaid,
 }
 
-// Implementing the Display trait for the LeaveName enum
 impl fmt::Display for LeaveName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let leave_name_str = match self {
@@ -47,15 +42,29 @@ impl fmt::Display for LeaveName {
     }
 }
 
-// LeaveStatus enum
-#[derive(
-    candid::CandidType, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Default, Debug,
-)]
+#[derive(candid::CandidType, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Default, Debug)]
 enum LeaveStatusEnum {
     #[default]
     Pending,
     Approved,
     Rejected,
+    Accrued,
+    Canceled,
+}
+
+#[derive(candid::CandidType, Deserialize, Serialize)]
+struct EmployeePayload {
+    name: String,
+    email: String,
+}
+
+#[derive(candid::CandidType, Deserialize, Serialize)]
+struct LeaveRequestPayload {
+    employee_id: u64,
+    leave_type_id: u64,
+    start_date: u64,
+    end_date: u64,
+    reason: String,
 }
 
 #[derive(candid::CandidType, Clone, Serialize, Deserialize, Default, Debug)]
@@ -65,7 +74,7 @@ struct LeaveRequest {
     leave_type_id: u64,
     start_date: u64,
     end_date: u64,
-    status: String,
+    status: LeaveStatusEnum,
     reason: String,
     created_at: u64,
 }
@@ -74,11 +83,12 @@ struct LeaveRequest {
 struct LeaveType {
     id: u64,
     name: LeaveName,
-    quota: u32, // Max days allowed per year
+    quota: u32,
     carryover_allowed: bool,
     created_at: u64,
 }
 
+// Implementing Storable for Employee, LeaveRequest, and LeaveType
 impl Storable for Employee {
     fn to_bytes(&self) -> Cow<[u8]> {
         Cow::Owned(Encode!(self).unwrap())
@@ -124,6 +134,7 @@ impl BoundedStorable for LeaveType {
     const IS_FIXED_SIZE: bool = false;
 }
 
+// Thread-local storages for managing data
 thread_local! {
     static MEMORY_MANAGER: RefCell<MemoryManager<DefaultMemoryImpl>> = RefCell::new(
         MemoryManager::init(DefaultMemoryImpl::default())
@@ -150,28 +161,7 @@ thread_local! {
     ));
 }
 
-#[derive(candid::CandidType, Deserialize, Serialize)]
-struct EmployeePayload {
-    name: String,
-    email: String,
-}
-
-#[derive(candid::CandidType, Deserialize, Serialize)]
-struct LeaveRequestPayload {
-    employee_id: u64,
-    leave_type_id: u64,
-    start_date: u64,
-    end_date: u64,
-    reason: String,
-}
-
-#[derive(candid::CandidType, Deserialize, Serialize)]
-struct LeaveTypePayload {
-    name: LeaveName,
-    quota: u32,
-    carryover_allowed: bool,
-}
-
+// Error-handling enum for messages
 #[derive(candid::CandidType, Deserialize, Serialize)]
 enum Message {
     Success(String),
@@ -180,26 +170,65 @@ enum Message {
     InvalidPayload(String),
 }
 
+// Utility function to get the current time in nanoseconds
+fn current_time() -> u64 {
+    time()
+}
+
+// New Feature: Auto-generating an email if not provided
+fn generate_email(name: &str) -> String {
+    format!("{}@company.com", name.to_lowercase().replace(' ', "."))
+}
+
+// Helper: Get leave type by ID
+fn get_leave_type(leave_type_id: u64) -> Result<LeaveType, Message> {
+    LEAVE_TYPES_STORAGE.with(|storage| {
+        storage
+            .borrow()
+            .get(&leave_type_id)
+            .ok_or(Message::NotFound("Leave type not found".to_string()))
+    })
+}
+
+// Helper: Increment ID counter
+fn increment_id_counter() -> Result<u64, Message> {
+    ID_COUNTER.with(|counter: &RefCell<IdCell>| {
+        let current_value = {
+            let counter_borrow = counter.borrow();  // Immutable borrow to get the value
+            *counter_borrow.get()                  // Copy the value out
+        };
+
+        {
+            let mut counter_borrow = counter.borrow_mut(); // Mutable borrow to set the new value
+            counter_borrow
+                .set(current_value + 1)
+                .expect("Failed to set new ID.");
+        }
+
+        Ok(current_value + 1) // Return the incremented value
+    })
+}
+
+
+
+
+// Create a new employee with error handling
 #[ic_cdk::update]
-fn create_employee(payload: EmployeePayload) -> Result<Employee, Message> {
-    if payload.name.is_empty() || payload.email.is_empty() {
-        return Err(Message::InvalidPayload(
-            "Ensure 'name' and 'email' are provided.".to_string(),
-        ));
+fn create_employee(mut payload: EmployeePayload) -> Result<Employee, Message> {
+    if payload.name.is_empty() {
+        return Err(Message::InvalidPayload("Employee name is required.".to_string()));
     }
 
-    let id = ID_COUNTER
-        .with(|counter| {
-            let current_value = *counter.borrow().get();
-            counter.borrow_mut().set(current_value + 1)
-        })
-        .expect("Cannot increment ID counter");
+    if payload.email.is_empty() {
+        payload.email = generate_email(&payload.name);
+    }
+
+    let id = increment_id_counter()?;
 
     let employee = Employee {
         id,
         name: payload.name,
         email: payload.email,
-        // Initialize the leave balances for the employee to 20 days for each leave type
         leave_balances: vec![
             (LeaveName::Annual, 20),
             (LeaveName::Sick, 20),
@@ -211,10 +240,12 @@ fn create_employee(payload: EmployeePayload) -> Result<Employee, Message> {
         .collect(),
         created_at: current_time(),
     };
+
     EMPLOYEE_STORAGE.with(|storage| storage.borrow_mut().insert(id, employee.clone()));
     Ok(employee)
 }
 
+// Query to fetch all employees
 #[ic_cdk::query]
 fn get_employees() -> Result<Vec<Employee>, Message> {
     EMPLOYEE_STORAGE.with(|storage| {
@@ -232,12 +263,30 @@ fn get_employees() -> Result<Vec<Employee>, Message> {
     })
 }
 
+// Search employees by name or email
+#[ic_cdk::query]
+fn search_employee(query: String) -> Result<Vec<Employee>, Message> {
+    let employees: Vec<Employee> = EMPLOYEE_STORAGE.with(|storage| {
+        storage
+            .borrow()
+            .iter()
+            .map(|(_, employee)| employee.clone())
+            .filter(|employee| employee.name.contains(&query) || employee.email.contains(&query))
+            .collect()
+    });
+
+    if employees.is_empty() {
+        Err(Message::NotFound("No matching employees found".to_string()))
+    } else {
+        Ok(employees)
+    }
+}
+
+// Create a leave request with error handling
 #[ic_cdk::update]
 fn create_leave_request(payload: LeaveRequestPayload) -> Result<LeaveRequest, Message> {
     if payload.reason.is_empty() {
-        return Err(Message::InvalidPayload(
-            "Ensure 'reason' is provided.".to_string(),
-        ));
+        return Err(Message::InvalidPayload("Ensure 'reason' is provided.".to_string()));
     }
 
     // Check if the leave_type_id exists
@@ -249,17 +298,10 @@ fn create_leave_request(payload: LeaveRequestPayload) -> Result<LeaveRequest, Me
     });
 
     if !leave_type_exists {
-        return Err(Message::InvalidPayload(
-            "Invalid leave_type_id provided.".to_string(),
-        ));
+        return Err(Message::InvalidPayload("Invalid leave_type_id provided.".to_string()));
     }
 
-    let id = ID_COUNTER
-        .with(|counter| {
-            let current_value = *counter.borrow().get();
-            counter.borrow_mut().set(current_value + 1)
-        })
-        .expect("Cannot increment ID counter");
+    let id = increment_id_counter()?;
 
     let leave_request = LeaveRequest {
         id,
@@ -267,7 +309,7 @@ fn create_leave_request(payload: LeaveRequestPayload) -> Result<LeaveRequest, Me
         leave_type_id: payload.leave_type_id,
         start_date: payload.start_date,
         end_date: payload.end_date,
-        status: "pending".to_string(),
+        status: LeaveStatusEnum::Pending,
         reason: payload.reason,
         created_at: current_time(),
     };
@@ -275,6 +317,7 @@ fn create_leave_request(payload: LeaveRequestPayload) -> Result<LeaveRequest, Me
     Ok(leave_request)
 }
 
+// Get all leave requests
 #[ic_cdk::query]
 fn get_leave_requests() -> Result<Vec<LeaveRequest>, Message> {
     LEAVE_REQUESTS_STORAGE.with(|storage| {
@@ -292,9 +335,9 @@ fn get_leave_requests() -> Result<Vec<LeaveRequest>, Message> {
     })
 }
 
+// Approve a leave request with error handling
 #[ic_cdk::update]
 fn approve_leave_request(request_id: u64) -> Result<Message, Message> {
-    // Fetch the specific leave request by ID
     let leave_request = LEAVE_REQUESTS_STORAGE.with(|storage| {
         storage
             .borrow()
@@ -309,14 +352,10 @@ fn approve_leave_request(request_id: u64) -> Result<Message, Message> {
 
     let mut request = leave_request.unwrap();
 
-    // Ensure the leave request is not already approved
-    if request.status == "approved" {
-        return Err(Message::Error(
-            "Leave request is already approved.".to_string(),
-        ));
+    if request.status == LeaveStatusEnum::Approved {
+        return Err(Message::Error("Leave request is already approved.".to_string()));
     }
 
-    // Fetch the employee associated with the leave request
     let employee = EMPLOYEE_STORAGE.with(|storage| {
         storage
             .borrow()
@@ -329,235 +368,15 @@ fn approve_leave_request(request_id: u64) -> Result<Message, Message> {
         return Err(Message::NotFound("Employee not found".to_string()));
     }
 
-    // Fetch the corresponding leave type
-    let leave_type = LEAVE_TYPES_STORAGE.with(|storage| {
-        storage
-            .borrow()
-            .get(&request.leave_type_id)
-            .map(|lt| lt.clone())
-    });
+    let leave_type = get_leave_type(request.leave_type_id)?;
 
-    if leave_type.is_none() {
-        return Err(Message::NotFound("Leave type not found".to_string()));
-    }
-
-    // Update the leave request status to "approved"
-    request.status = "approved".to_string();
+    request.status = LeaveStatusEnum::Approved;
     LEAVE_REQUESTS_STORAGE.with(|storage| storage.borrow_mut().insert(request_id, request));
 
-    Ok(Message::Success(
-        "Leave request approved and leave balance updated.".to_string(),
-    ))
+    Ok(Message::Success("Leave request approved.".to_string()))
 }
 
-#[ic_cdk::update]
-fn reject_leave_request(request_id: u64) -> Result<Message, Message> {
-    let leave_request = LEAVE_REQUESTS_STORAGE.with(|storage| {
-        storage
-            .borrow()
-            .iter()
-            .find(|(_, request)| request.id == request_id)
-            .map(|(_, request)| request.clone())
-    });
-
-    if leave_request.is_none() {
-        return Err(Message::NotFound("Leave request not found".to_string()));
-    }
-
-    let mut request = leave_request.unwrap();
-    request.status = "rejected".to_string();
-    LEAVE_REQUESTS_STORAGE.with(|storage| storage.borrow_mut().insert(request_id, request));
-
-    Ok(Message::Success("Leave request rejected.".to_string()))
-}
-
-#[ic_cdk::update]
-fn create_leave_type(payload: LeaveTypePayload) -> Result<LeaveType, Message> {
-    let id = ID_COUNTER
-        .with(|counter| {
-            let current_value = *counter.borrow().get();
-            counter.borrow_mut().set(current_value + 1)
-        })
-        .expect("Cannot increment ID counter");
-
-    let leave_type = LeaveType {
-        id,
-        name: payload.name,
-        quota: payload.quota,
-        carryover_allowed: payload.carryover_allowed,
-        created_at: current_time(),
-    };
-    LEAVE_TYPES_STORAGE.with(|storage| storage.borrow_mut().insert(id, leave_type.clone()));
-    Ok(leave_type)
-}
-
-#[ic_cdk::query]
-fn get_leave_types() -> Result<Vec<LeaveType>, Message> {
-    LEAVE_TYPES_STORAGE.with(|storage| {
-        let leave_types: Vec<LeaveType> = storage
-            .borrow()
-            .iter()
-            .map(|(_, leave_type)| leave_type.clone())
-            .collect();
-
-        if leave_types.is_empty() {
-            Err(Message::NotFound("No leave types found".to_string()))
-        } else {
-            Ok(leave_types)
-        }
-    })
-}
-
-#[ic_cdk::update]
-fn accrue_leave(leave_request_id: u64) -> Result<Message, Message> {
-    // Fetch the specific leave request by ID
-    let leave_request = LEAVE_REQUESTS_STORAGE.with(|storage| {
-        storage
-            .borrow()
-            .iter()
-            .find(|(_, request)| request.id == leave_request_id)
-            .map(|(_, request)| request.clone())
-    });
-
-    if leave_request.is_none() {
-        return Err(Message::NotFound("Leave request not found".to_string()));
-    }
-
-    let mut leave_request = leave_request.unwrap();
-
-    // Ensure the leave request is approved and not already accrued
-    if leave_request.status == "accrued" {
-        return Err(Message::Error("Leave request already accrued.".to_string()));
-    }
-
-    if leave_request.status != "approved" {
-        return Err(Message::Error("Leave request is not approved.".to_string()));
-    }
-
-    // Fetch the employee associated with the leave request
-    let employee = EMPLOYEE_STORAGE.with(|storage| {
-        storage
-            .borrow()
-            .iter()
-            .find(|(_, employee)| employee.id == leave_request.employee_id)
-            .map(|(_, employee)| employee.clone())
-    });
-
-    if employee.is_none() {
-        return Err(Message::NotFound("Employee not found".to_string()));
-    }
-
-    let mut employee = employee.unwrap();
-
-    // Fetch the corresponding leave type
-    let leave_type = LEAVE_TYPES_STORAGE.with(|storage| {
-        storage
-            .borrow()
-            .get(&leave_request.leave_type_id)
-            .map(|lt| lt.clone())
-    });
-
-    if leave_type.is_none() {
-        return Err(Message::NotFound("Leave type not found".to_string()));
-    }
-
-    let leave_type = leave_type.unwrap();
-
-    // Fetch the current balance or default to zero if none exists
-    let balance = employee
-        .leave_balances
-        .entry(leave_type.name.clone())
-        .or_insert(0);
-
-    // Debug print to check the balance before updating
-    ic_cdk::println!("Current balance for {:?}: {}", leave_type.name, balance);
-
-    // Subtract the leave type's quota from the balance
-    *balance = balance.saturating_sub(leave_type.quota);
-
-    // Debug print to check the balance after updating
-    ic_cdk::println!("Updated balance for {:?}: {}", leave_type.name, *balance);
-
-    // Update the leave request status to "accrued"
-    leave_request.status = "accrued".to_string();
-
-    // Update the leave request in the storage
-    LEAVE_REQUESTS_STORAGE
-        .with(|storage| storage.borrow_mut().insert(leave_request_id, leave_request));
-
-    // Update the employee in the storage
-    EMPLOYEE_STORAGE.with(|storage| storage.borrow_mut().insert(employee.id, employee));
-
-    Ok(Message::Success(
-        "Leave request accrued successfully and balance updated.".to_string(),
-    ))
-}
-
-#[ic_cdk::query]
-fn generate_leave_report(employee_id: u64) -> Result<String, Message> {
-    let leave_requests = LEAVE_REQUESTS_STORAGE.with(|storage| {
-        storage
-            .borrow()
-            .iter()
-            .filter(|(_, request)| request.employee_id == employee_id)
-            .map(|(_, request)| request.clone())
-            .collect::<Vec<LeaveRequest>>()
-    });
-
-    let employee = EMPLOYEE_STORAGE.with(|storage| {
-        storage
-            .borrow()
-            .iter()
-            .find(|(_, employee)| employee.id == employee_id)
-            .map(|(_, employee)| employee.clone())
-    });
-
-    if employee.is_none() {
-        return Err(Message::NotFound("Employee not found".to_string()));
-    }
-
-    let employee = employee.unwrap();
-
-    let mut report = format!(
-        "Leave report for {} (Employee ID: {})\n\n",
-        employee.name, employee.id
-    );
-
-    for request in leave_requests {
-        let leave_type = LEAVE_TYPES_STORAGE.with(|storage| {
-            storage
-                .borrow()
-                .iter()
-                .find(|(_, leave_type)| leave_type.id == request.leave_type_id)
-                .map(|(_, leave_type)| leave_type.clone())
-        });
-
-        if leave_type.is_none() {
-            return Err(Message::NotFound("Leave type not found".to_string()));
-        }
-
-        let leave_type = leave_type.unwrap();
-        let leave_balance = employee.leave_balances.get(&leave_type.name).unwrap_or(&0);
-
-        // Correctly calculate the remaining leaves
-        let remaining_leaves = *leave_balance;
-
-        report += &format!(
-            "Leave Request ID: {}\nLeave Type: {}\nQuota: {}\nRemaining Leaves: {}\nStart Date: {}\nEnd Date: {}\nStatus: {}\nReason: {}\n\n",
-            request.id,
-            leave_type.name,
-            leave_type.quota,
-            remaining_leaves,
-            request.start_date,
-            request.end_date,
-            request.status,
-            request.reason
-        );
-    }
-
-    Ok(report)
-}
-
+// Cancel a leave request with error handling
 #[ic_cdk::update]
 fn cancel_leave_request(request_id: u64) -> Result<Message, Message> {
     let leave_request = LEAVE_REQUESTS_STORAGE.with(|storage| {
@@ -573,19 +392,80 @@ fn cancel_leave_request(request_id: u64) -> Result<Message, Message> {
     }
 
     let request = leave_request.unwrap();
-    if request.status == "approved" {
-        return Err(Message::Error(
-            "Cannot cancel an approved leave request.".to_string(),
-        ));
+    if request.status == LeaveStatusEnum::Approved {
+        return Err(Message::Error("Cannot cancel an approved leave request.".to_string()));
     }
 
     LEAVE_REQUESTS_STORAGE.with(|storage| storage.borrow_mut().remove(&request_id));
-
     Ok(Message::Success("Leave request canceled.".to_string()))
 }
 
-fn current_time() -> u64 {
-    time()
+// Generate a leave report for an employee
+#[ic_cdk::query]
+fn generate_leave_report(employee_id: u64) -> Result<String, Message> {
+    let leave_requests = get_employee_leave_requests(employee_id)?;
+    let employee = get_employee_by_id(employee_id)?;
+
+    let mut report = format!(
+        "Leave report for {} (Employee ID: {})\n\n",
+        employee.name, employee.id
+    );
+
+    let mut total_days_by_type: HashMap<LeaveName, u32> = HashMap::new();
+
+    for request in leave_requests {
+        let leave_type = get_leave_type(request.leave_type_id)?;
+        let balance = employee.leave_balances.get(&leave_type.name).unwrap_or(&0);
+
+        *total_days_by_type.entry(leave_type.name).or_insert(0) += leave_type.quota;
+
+        report += &format!(
+            "Leave Request ID: {}\nLeave Type: {}\nStart Date: {}\nEnd Date: {}\nStatus: {:?}\nReason: {}\nRemaining Balance: {}\n\n",
+            request.id,
+            leave_type.name,
+            request.start_date,
+            request.end_date,
+            request.status,
+            request.reason,
+            balance
+        );
+    }
+
+    report += "Summary of Leave Taken by Type:\n";
+    for (leave_name, total_days) in total_days_by_type {
+        report += &format!("{}: {} days\n", leave_name, total_days);
+    }
+
+    Ok(report)
 }
 
+// Helper function to get employee by ID
+fn get_employee_by_id(employee_id: u64) -> Result<Employee, Message> {
+    EMPLOYEE_STORAGE.with(|storage| {
+        storage
+            .borrow()
+            .get(&employee_id)
+            .ok_or(Message::NotFound("Employee not found".to_string()))
+    })
+}
+
+// Helper function to get employee leave requests by ID
+fn get_employee_leave_requests(employee_id: u64) -> Result<Vec<LeaveRequest>, Message> {
+    LEAVE_REQUESTS_STORAGE.with(|storage| {
+        let requests: Vec<LeaveRequest> = storage
+            .borrow()
+            .iter()
+            .filter(|(_, request)| request.employee_id == employee_id)
+            .map(|(_, request)| request.clone())
+            .collect();
+
+        if requests.is_empty() {
+            Err(Message::NotFound("No leave requests found".to_string()))
+        } else {
+            Ok(requests)
+        }
+    })
+}
+
+// Export the Candid interface for the system
 ic_cdk::export_candid!();
